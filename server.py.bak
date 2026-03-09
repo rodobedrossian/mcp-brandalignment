@@ -1,0 +1,165 @@
+import os, sys, re, time
+from contextlib import contextmanager
+from typing import List, Tuple
+from dotenv import load_dotenv
+load_dotenv()
+
+try:
+    from mcp.server.fastmcp import FastMCP
+    from mcp import types
+except Exception as e:
+    print("Error importando 'mcp'. Instalá mcp[fastmcp].", file=sys.stderr)
+    raise
+
+import mysql.connector
+
+# === Config obligatoria ===
+def need(name):
+    v = os.getenv(name, "")
+    if not v:
+        print(f"FALTA variable obligatoria: {name}", file=sys.stderr)
+        sys.exit(1)
+    return v
+
+MYSQL_HOST = need("MYSQL_HOST")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
+MYSQL_USER = need("MYSQL_USER")
+MYSQL_PASSWORD = need("MYSQL_PASSWORD")
+MYSQL_DATABASE = need("MYSQL_DATABASE")
+
+# === Config opcional ===
+MCP_MAX_ROWS = int(os.getenv("MCP_MAX_ROWS", "200"))
+MCP_QUERY_TIMEOUT = int(os.getenv("MCP_QUERY_TIMEOUT", "15"))
+ALLOWED_TABLES = [t.strip() for t in os.getenv("MCP_ALLOWED_TABLES", "").split(",") if t.strip()]
+DENIED_COLUMNS = {c.strip().lower() for c in os.getenv("MCP_DENIED_COLUMNS", "").split(",") if c.strip()}
+
+app = FastMCP("mysql-mcp-local")
+
+def get_conn():
+    cn = mysql.connector.connect(
+        host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER,
+        password=MYSQL_PASSWORD, database=MYSQL_DATABASE,
+        connection_timeout=10
+    )
+    try:
+        cur = cn.cursor()
+        cur.execute("SET SESSION TRANSACTION READ ONLY")
+        cur.close()
+    except Exception:
+        pass
+    return cn
+
+@contextmanager
+def mysql_cursor():
+    cn = get_conn()
+    try:
+        try:
+            cur = cn.cursor()
+            cur.execute(f"SET SESSION MAX_EXECUTION_TIME={(MCP_QUERY_TIMEOUT * 1000)}")
+            cur.close()
+        except Exception:
+            pass
+        cur = cn.cursor()
+        yield cn, cur
+    finally:
+        try: cur.close()
+        except Exception: pass
+        try: cn.close()
+        except Exception: pass
+
+def _mask_row(cols: List[str], row: Tuple) -> List[str]:
+    out = []
+    for col, val in zip(cols, row):
+        out.append("***REDACTED***" if col.lower() in DENIED_COLUMNS else ("" if val is None else str(val)))
+    return out
+
+def _format_tsv(headers: List[str], rows: List[List[str]]) -> str:
+    lines = ["\t".join(headers)]
+    for r in rows:
+        lines.append("\t".join(r))
+    return "\n".join(lines)
+
+def _deny_non_select(sql: str) -> None:
+    s = sql.strip().lower()
+    if not (s.startswith("select ") or s.startswith("with ")):
+        raise ValueError("Solo se permiten SELECT/CTE.")
+    forbidden = [" update ", " delete ", " insert ", " drop ", " alter ", " truncate ", " create "]
+    s2 = f" {s} "
+    for bad in forbidden:
+        if bad in s2:
+            raise ValueError(f"Comando no permitido: {bad.strip().upper()}")
+
+def _enforce_allowed_tables(sql: str) -> None:
+    if not ALLOWED_TABLES: return
+    tokens = re.findall(r"[`\"]?([a-zA-Z0-9_]+)[`\"]?(?:\s*\.\s*[`\"]?([a-zA-Z0-9_]+)[`\"]?)?", sql)
+    probable = set()
+    for a,b in tokens:
+        probable.add((b or a).lower())
+    non_tables = {
+        "select","from","where","join","on","group","by","order","limit","offset","and","or","asc","desc",
+        "count","sum","avg","min","max","distinct","as","with","over","partition","case","when","then","else","end",
+        "inner","left","right","full","outer","union","all","having","like","in","is","null","not","between","exists"
+    }
+    probable = {t for t in probable if t not in non_tables}
+    allowed = {x.lower() for x in ALLOWED_TABLES}
+    not_allowed = {t for t in probable if t not in allowed}
+    if not_allowed:
+        raise ValueError(f"Tablas no permitidas detectadas: {', '.join(sorted(not_allowed))}. Permitidas: {', '.join(ALLOWED_TABLES)}")
+
+def _append_limit(sql: str, max_rows: int) -> str:
+    s = sql.strip().rstrip(";")
+    if re.search(r"\blimit\b\s+\d+", s, flags=re.IGNORECASE):
+        return s
+    return f"{s} LIMIT {max_rows}"
+
+@app.tool()
+def health() -> types.TextContent:
+    try:
+        with mysql_cursor() as (_cn, cur):
+            cur.execute("SELECT 1")
+            _ = cur.fetchall()
+        return types.TextContent(text="OK")
+    except Exception as e:
+        return types.TextContent(text=f"ERROR: {e}")
+
+@app.tool()
+def describe_schema() -> types.TextContent:
+    with mysql_cursor() as (_cn, cur):
+        cur.execute("""
+            SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+            ORDER BY TABLE_NAME, ORDINAL_POSITION
+        """)
+        rows = cur.fetchall()
+    lines = []
+    for t, c, d in rows:
+        red = " [REDACTED]" if c.lower() in DENIED_COLUMNS else ""
+        lines.append(f"{t}.{c} {d}{red}")
+    return types.TextContent(text="\n".join(lines) if lines else "(Sin columnas)")
+
+@app.tool()
+def run_sql(query: str, max_rows: int = MCP_MAX_ROWS) -> types.TextContent:
+    if not query or not isinstance(query, str):
+        return types.TextContent(text="Error: 'query' es obligatorio (string).")
+    if max_rows <= 0: max_rows = MCP_MAX_ROWS
+    _deny_non_select(query)
+    _enforce_allowed_tables(query)
+    final_sql = _append_limit(query, max_rows)
+    t0 = time.time()
+    try:
+        with mysql_cursor() as (_cn, cur):
+            cur.execute(final_sql)
+            cols = [d[0] for d in cur.description] if cur.description else []
+            data = cur.fetchall() if cols else []
+    except mysql.connector.Error as e:
+        return types.TextContent(text=f"Error MySQL: {e}")
+    except Exception as e:
+        return types.TextContent(text=f"Error: {e}")
+    rows = [_mask_row(cols, r) for r in data]
+    out = _format_tsv(cols, rows) if cols else "(Sin resultados)"
+    meta = f"-- rows={len(rows)} cols={len(cols)} time_s={time.time()-t0:.3f} limit={max_rows}"
+    return types.TextContent(text=f"{out}\n\n{meta}")
+
+if __name__ == "__main__":
+    app.run()

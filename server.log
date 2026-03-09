@@ -1,0 +1,2 @@
+Warning: 'requests' not available. RAG enrichment will be disabled.
+Warning: Semantic-layer integration unavailable: No module named 'requests'
